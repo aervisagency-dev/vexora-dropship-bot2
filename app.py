@@ -1,7 +1,16 @@
-import os, json, sqlite3, datetime, requests, urllib.parse, random, hashlib, threading
+import os, json, datetime, requests, urllib.parse, random, hashlib, threading, re
 from flask import Flask, request, redirect, jsonify, make_response
 
 app = Flask(__name__)
+
+# ===================== DATABASE CONFIG =====================
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+USE_POSTGRES = DATABASE_URL.startswith('postgres')
+
+if USE_POSTGRES:
+    import psycopg2, psycopg2.extras
+else:
+    import sqlite3
 
 DB_PATH = os.environ.get('DB_PATH', '/data/orders.db') if os.path.isdir('/data') else 'orders.db'
 RESEND_KEY = os.environ.get('RESEND_API_KEY', '')
@@ -332,38 +341,87 @@ STATUS_MESSAGES = {
     'cancelled': {'subject': 'Order Cancelled', 'heading': 'Cancelled', 'body': 'Your order has been cancelled. If you have any questions, don\'t hesitate to reach out to us.'},
 }
 
+def _sqlite_to_pg(sql):
+    """Convert SQLite SQL to PostgreSQL compatible SQL"""
+    sql = sql.replace('INTEGER PRIMARY KEY AUTOINCREMENT', 'SERIAL PRIMARY KEY')
+    sql = sql.replace('?', '%s')
+    # IF NOT EXISTS works in both
+    return sql
+
+class PgRowWrapper:
+    """Makes psycopg2 DictRow behave like sqlite3.Row for safe_get compatibility"""
+    def __init__(self, row, cursor):
+        self._row = row
+        self._cursor = cursor
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._row[key]
+        return self._row[key]
+    def keys(self):
+        return self._row.keys() if hasattr(self._row, 'keys') else []
+
+class PgCursorWrapper:
+    """Wraps psycopg2 cursor to convert ? to %s and return compatible rows"""
+    def __init__(self, conn):
+        self._conn = conn
+        self._cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    def execute(self, sql, params=None):
+        sql = _sqlite_to_pg(sql)
+        if params:
+            self._cursor.execute(sql, params)
+        else:
+            self._cursor.execute(sql)
+        return self
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return row
+    def fetchall(self):
+        return self._cursor.fetchall()
+    def commit(self):
+        self._conn.commit()
+    def close(self):
+        self._cursor.close()
+        self._conn.close()
+    @property
+    def row_factory(self):
+        return None
+    @row_factory.setter
+    def row_factory(self, val):
+        pass  # ignore — we always use DictCursor
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute('''CREATE TABLE IF NOT EXISTS orders(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT, order_number TEXT,
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        db = PgCursorWrapper(conn)
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        db = conn
+
+    # Create tables
+    db.execute('''CREATE TABLE IF NOT EXISTS orders(
+        id SERIAL PRIMARY KEY, order_id TEXT, order_number TEXT,
         product_name TEXT, product_url TEXT, customer_email TEXT,
         shipping_name TEXT, shipping_address TEXT, shipping_city TEXT,
         shipping_zip TEXT, shipping_phone TEXT, total TEXT, currency TEXT,
         status TEXT DEFAULT 'new', tracking_number TEXT DEFAULT '',
         tracking_carrier TEXT DEFAULT '', tracking_url TEXT DEFAULT '',
-        created_at TEXT, updated_at TEXT, timeline TEXT DEFAULT '[]')''')
-    conn.execute('''CREATE TABLE IF NOT EXISTS messages(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, email TEXT,
+        created_at TEXT, updated_at TEXT, timeline TEXT DEFAULT '[]',
+        product_image TEXT DEFAULT '')''')
+    db.execute('''CREATE TABLE IF NOT EXISTS messages(
+        id SERIAL PRIMARY KEY, name TEXT, email TEXT,
         subject TEXT, order_number TEXT, message TEXT,
         status TEXT DEFAULT 'new', created_at TEXT,
         replies TEXT DEFAULT '[]')''')
-    # Add missing columns to old tables — covers ALL possible missing columns
-    all_order_cols = [
-        ('order_id',''),('order_number',''),('product_name',''),('product_url',''),
-        ('customer_email',''),('shipping_name',''),('shipping_address',''),
-        ('shipping_city',''),('shipping_zip',''),('shipping_phone',''),
-        ('total',''),('currency',''),('status','new'),
-        ('tracking_number',''),('tracking_carrier',''),('tracking_url',''),
-        ('created_at',''),('updated_at',''),('timeline','[]'),('product_image','')
-    ]
-    for col, default in all_order_cols:
-        try:
-            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT DEFAULT '{default}'")
-        except:
-            pass
-    conn.commit()
-    return conn
+    db.execute('''CREATE TABLE IF NOT EXISTS subscribers(
+        id SERIAL PRIMARY KEY, email TEXT UNIQUE,
+        language TEXT DEFAULT 'ro', subscribed_at TEXT,
+        status TEXT DEFAULT 'active')''')
+    db.execute('''CREATE TABLE IF NOT EXISTS newsletter_log(
+        id SERIAL PRIMARY KEY, template_id TEXT, subject TEXT,
+        sent_at TEXT, recipients INTEGER, status TEXT)''')
+    db.commit()
+    return db
 
 def safe_get(row, key, default=''):
     try:
@@ -468,12 +526,12 @@ def cors_response(data, status=200):
 @app.route('/health')
 def health():
     db = get_db()
-    oc = db.execute('SELECT COUNT(*) FROM orders').fetchone()[0]
-    mc = db.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
+    oc = db.execute('SELECT COUNT(*) as cnt FROM orders').fetchone()['cnt']
+    mc = db.execute('SELECT COUNT(*) as cnt FROM messages').fetchone()['cnt']
     db.execute('''CREATE TABLE IF NOT EXISTS subscribers(
         id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE,
         subscribed_at TEXT, status TEXT DEFAULT 'active')''')
-    sc = db.execute('SELECT COUNT(*) FROM subscribers').fetchone()[0]
+    sc = db.execute('SELECT COUNT(*) as cnt FROM subscribers').fetchone()['cnt']
     db.close()
     return jsonify({'status': 'online', 'orders': oc, 'messages': mc, 'subscribers': sc})
 
