@@ -1264,6 +1264,95 @@ def admin():
         <span style="font-size:11px;color:#666">They will receive future newsletters automatically</span>
         </div>
         </form></details>
+        
+        <details style="margin-bottom:16px;margin-top:12px">
+        <summary style="color:#c9a227;font-size:12px;font-weight:700;cursor:pointer;padding:8px 0;letter-spacing:1px">📂 IMPORT CSV (DRAG & DROP)</summary>
+        <div id="csvDropZone" style="margin-top:12px;padding:32px 20px;border:2px dashed rgba(201,162,39,.3);border-radius:12px;background:rgba(201,162,39,.03);text-align:center;cursor:pointer;transition:all .3s"
+             ondragover="event.preventDefault();this.style.borderColor='#c9a227';this.style.background='rgba(201,162,39,.08)'"
+             ondragleave="this.style.borderColor='rgba(201,162,39,.3)';this.style.background='rgba(201,162,39,.03)'"
+             ondrop="event.preventDefault();this.style.borderColor='rgba(201,162,39,.3)';this.style.background='rgba(201,162,39,.03)';handleCSVDrop(event)">
+            <div style="font-size:28px;margin-bottom:8px">📄</div>
+            <p style="color:#c9a227;font-size:13px;font-weight:600;margin:0 0 4px">Drag & drop a CSV file here</p>
+            <p style="color:#666;font-size:11px;margin:0">WooCommerce export, Mailchimp export, or any CSV with an email column</p>
+        </div>
+        <div id="csvResult" style="display:none;margin-top:12px;padding:14px;border-radius:8px;font-size:13px"></div>
+        <script>
+        function handleCSVDrop(e){{
+            var file = e.dataTransfer.files[0];
+            if(!file) return;
+            if(!file.name.endsWith('.csv') && !file.name.endsWith('.txt')){{
+                var r=document.getElementById('csvResult');
+                r.style.display='block';r.style.background='rgba(239,68,68,.1)';r.style.border='1px solid rgba(239,68,68,.3)';r.style.color='#f87171';
+                r.textContent='❌ Only .csv files are supported';
+                return;
+            }}
+            var reader = new FileReader();
+            reader.onload = function(ev){{
+                var text = ev.target.result;
+                var lines = text.split(/\\r?\\n/);
+                var emails = [];
+                var emailCol = -1;
+                // Find email column in header
+                if(lines.length > 0){{
+                    var header = lines[0].toLowerCase().split(',');
+                    for(var i=0;i<header.length;i++){{
+                        var h = header[i].replace(/"/g,'').trim();
+                        if(h==='email'||h==='e-mail'||h==='email address'||h==='customer_email'||h==='billing_email'||h==='subscriber_email'){{
+                            emailCol = i; break;
+                        }}
+                    }}
+                    if(emailCol===-1){{
+                        // Try to find column with @ in first data row
+                        if(lines.length>1){{
+                            var row1 = lines[1].split(',');
+                            for(var i=0;i<row1.length;i++){{
+                                if(row1[i].indexOf('@')!==-1){{ emailCol=i; break; }}
+                            }}
+                        }}
+                    }}
+                }}
+                if(emailCol===-1){{
+                    var r=document.getElementById('csvResult');
+                    r.style.display='block';r.style.background='rgba(239,68,68,.1)';r.style.border='1px solid rgba(239,68,68,.3)';r.style.color='#f87171';
+                    r.textContent='❌ Could not find an email column in the CSV';
+                    return;
+                }}
+                for(var j=1;j<lines.length;j++){{
+                    var cols = lines[j].split(',');
+                    if(cols[emailCol]){{
+                        var em = cols[emailCol].replace(/"/g,'').trim().toLowerCase();
+                        if(em && em.indexOf('@')!==-1 && emails.indexOf(em)===-1) emails.push(em);
+                    }}
+                }}
+                if(emails.length===0){{
+                    var r=document.getElementById('csvResult');
+                    r.style.display='block';r.style.background='rgba(239,68,68,.1)';r.style.border='1px solid rgba(239,68,68,.3)';r.style.color='#f87171';
+                    r.textContent='❌ No valid emails found in CSV';
+                    return;
+                }}
+                var r=document.getElementById('csvResult');
+                r.style.display='block';r.style.background='rgba(201,162,39,.08)';r.style.border='1px solid rgba(201,162,39,.2)';r.style.color='#c9a227';
+                r.innerHTML='⏳ Importing '+emails.length+' emails...';
+                fetch('/admin/import-subscribers',{{
+                    method:'POST',
+                    headers:{{'Content-Type':'application/json'}},
+                    body:JSON.stringify({{pw:'{pw}',emails:emails}})
+                }}).then(function(r){{return r.json()}}).then(function(d){{
+                    var r=document.getElementById('csvResult');
+                    if(d.success){{
+                        r.style.background='rgba(34,197,94,.08)';r.style.border='1px solid rgba(34,197,94,.3)';r.style.color='#4ade80';
+                        r.innerHTML='✅ Done! Added: <strong>'+d.added+'</strong> | Already existed: <strong>'+d.skipped+'</strong>';
+                        setTimeout(function(){{ location.reload(); }}, 2000);
+                    }} else {{
+                        r.style.background='rgba(239,68,68,.1)';r.style.border='1px solid rgba(239,68,68,.3)';r.style.color='#f87171';
+                        r.textContent='❌ Error: '+(d.error||'Unknown error');
+                    }}
+                }});
+            }};
+            reader.readAsText(file);
+        }}
+        </script>
+        </details>
         </div>'''
 
         # Subscriber list
@@ -1628,6 +1717,56 @@ def unsubscribe():
     <div><h2 style="color:#c9a227;margin-bottom:15px">Dezabonat cu succes</h2>
     <p style="color:#888">Nu vei mai primi newslettere de la Vexora Maison.</p>
     <p style="margin-top:20px"><a href="{SITE_URL}" style="color:#c9a227">Înapoi la magazin</a></p></div></body></html>'''
+
+# ===================== ADMIN IMPORT SUBSCRIBERS (CSV drag-drop) =====================
+@app.route('/admin/import-subscribers', methods=['POST', 'OPTIONS'])
+def admin_import_subscribers():
+    if request.method == 'OPTIONS':
+        return cors_response({})
+    try:
+        d = request.get_json()
+        pw = d.get('pw', '')
+        if pw != DASH_PASS:
+            return cors_response({'success': False, 'error': 'Unauthorized'}, 401)
+        
+        emails = d.get('emails', [])
+        if not emails:
+            return cors_response({'success': False, 'error': 'No emails provided'})
+        
+        db = get_db()
+        added = 0
+        skipped = 0
+        now = datetime.datetime.now().isoformat()
+        
+        for email in emails:
+            email = email.strip().lower()
+            if not email or '@' not in email:
+                continue
+            try:
+                existing = db.execute('SELECT id, status FROM subscribers WHERE email=%s', (email,)).fetchone() if USE_POSTGRES else db.execute('SELECT id, status FROM subscribers WHERE email=?', (email,)).fetchone()
+                if existing:
+                    if existing['status'] == 'unsubscribed':
+                        if USE_POSTGRES:
+                            db.execute("UPDATE subscribers SET status='active' WHERE email=%s", (email,))
+                        else:
+                            db.execute("UPDATE subscribers SET status='active' WHERE email=?", (email,))
+                        added += 1
+                    else:
+                        skipped += 1
+                else:
+                    if USE_POSTGRES:
+                        db.execute('INSERT INTO subscribers(email, subscribed_at, status) VALUES(%s,%s,%s)', (email, now, 'active'))
+                    else:
+                        db.execute('INSERT INTO subscribers(email, subscribed_at, status) VALUES(?,?,?)', (email, now, 'active'))
+                    added += 1
+            except Exception:
+                skipped += 1
+        
+        db.commit()
+        db.close()
+        return cors_response({'success': True, 'added': added, 'skipped': skipped})
+    except Exception as e:
+        return cors_response({'success': False, 'error': str(e)}, 500)
 
 # ===================== ADMIN NEWSLETTER SEND =====================
 @app.route('/admin/newsletter', methods=['POST'])
